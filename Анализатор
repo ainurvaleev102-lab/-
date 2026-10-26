@@ -1,0 +1,158 @@
+import logging
+import asyncio
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+import pandas as pd
+import numpy as np
+
+# --- НАСТРОЙКИ ---
+API_TOKEN = 8867911287:AAF25AnRndUBGOAeB-IJL4e8dM5YDg-mmOk
+
+logging.basicConfig(level=logging.INFO)
+dp = Dispatcher()
+bot = Bot(token=API_TOKEN)
+
+# Глобальная переменная для асинхронной HTTP-сессии
+http_session: aiohttp.ClientSession = None
+
+# --- ФУНКЦИИ ВЗАИМОДЕЙСТВИЯ С MOEX API ---
+
+async def fetch_moex_data(ticker: str, days: int = 60) -> pd.DataFrame:
+    """
+    Асинхронно загружает дневные свечи с Московской Биржи.
+    Проверяет сначала рынок акций (shares), затем рынок фьючерсов (forts).
+    """
+    global http_session
+    
+    # Считаем дату начала выборки
+    start_date = (pd.Timestamp.now() - pd.Timedelta(days=days)).strftime('%Y-%m-%d')
+    
+    # 1. Пробуем найти инструмент на рынке акций (Т+2)
+    url = f"https://moex.com{ticker}/candles.json"
+    params = {'from': start_date, 'interval': '24', 'iss.json': 'extended'}
+    
+    async with http_session.get(url, params=params) as response:
+        if response.status != 200:
+            return pd.DataFrame()
+        raw_data = await response.json()
+        
+    # Если на рынке акций пусто, пробуем срочный рынок (фьючерсы)
+    # Для фьючерсов ищем в режиме RFUD (основной режим клиринга)
+    if not raw_data[1].get('candles') or len(raw_data[1]['candles']) == 0:
+        url = f"https://moex.com{ticker}/candles.json"
+        async with http_session.get(url, params=params) as response:
+            if response.status != 200:
+                return pd.DataFrame()
+            raw_data = await response.json()
+
+    # Парсим JSON-ответ от ISS MOEX
+    try:
+        candles_list = raw_data[1]['candles']
+        if not candles_list:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(candles_list)
+        # Нам нужны только цена закрытия и объем
+        df = df[['close', 'volume']].rename(columns={'close': 'Close', 'volume': 'Volume'})
+        return df
+    except (IndexError, KeyError):
+        return pd.DataFrame()
+
+# --- ТЕХНИЧЕСКИЙ АНАЛИЗ ---
+
+def calculate_indicators_and_signal(data: pd.DataFrame, ticker: str) -> str:
+    """Вычисляет EMA, RSI и генерирует отчет (выполняется мгновенно в памяти)"""
+    if data.empty or len(data) < 22:
+        return f"❌ Ошибка: Не удалось получить достаточно данных по тикеру {ticker}."
+
+    # Расчет индикаторов
+    data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
+    data['EMA21'] = data['Close'].ewm(span=21, adjust=False).mean()
+    
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    
+    # Защита от деления на ноль при расчете RSI
+    rs = gain / loss.replace(0, np.nan)
+    data['RSI'] = 100 - (100 / (1 + rs))
+    data['RSI'] = data['RSI'].fillna(50) # Дефолтное значение если нет колебаний
+
+    # Извлекаем скаляры
+    last_close = float(data['Close'].iloc[-1])
+    ema9 = float(data['EMA9'].iloc[-1])
+    ema21 = float(data['EMA21'].iloc[-1])
+    rsi = float(data['RSI'].iloc[-1])
+    volume = float(data['Volume'].iloc[-1])
+
+    signal = "🟡 НАБЛЮДЕНИЕ"
+    
+    if last_close > ema9 and ema9 > ema21 and rsi < 70:
+        signal = "🟢 ПОКУПАТЬ (Тренд вверх)"
+    elif last_close < ema9 and ema9 < ema21 and rsi > 30:
+        signal = "🔴 ПРОДАВАТЬ (Тренд вниз)"
+    elif rsi > 75:
+        signal = "⚠️ ПЕРЕКУПЛЕННОСТЬ (Возможна коррекция)"
+    elif rsi < 25:
+        signal = "⚠️ ПЕРЕПРОДАННОСТЬ (Возможен отскок)"
+
+    # Для фьючерсов объемы могут быть в штуках контрактов, для акций — в рублях/штуках.
+    # Выводим как есть, округляя до тысяч/миллионов для красоты.
+    vol_str = f"{int(volume/1_000_000)} млн" if volume >= 1_000_000 else f"{int(volume/1_000)} тыс"
+
+    return (f"📊 <b>Анализ {ticker.upper()} (MOEX)</b>\n\n"
+            f"Сигнал: {signal}\n"
+            f"Цена: {last_close:.2f}\n"
+            f"RSI: {rsi:.2f}\n"
+            f"EMA(9): {ema9:.2f} | EMA(21): {ema21:.2f}\n"
+            f"Объем посл. свечи: {vol_str}")
+
+# --- ХЭНДЛЕРЫ БОТА ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 Привет! Я полностью асинхронный анализатор MOEX.\n\n"
+        "Отправьте мне тикер акции или фьючерса напрямую с Московской Биржи.\n"
+        "Примеры:\n"
+        "📈 Акции: <code>SBER</code>, <code>GAZP</code>, <code>LKOH</code>\n"
+        "📉 Фьючерсы: <code>Si-12.26</code> (или краткий код инструмента)."
+    )
+
+@dp.message()
+async def analyze_message(message: types.Message):
+    ticker = message.text.strip().upper()
+    
+    if len(ticker) > 15:
+        await message.answer("❌ Слишком длинный тикер.")
+        return
+
+    status_message = await message.answer("⏳ Запрашиваю данные у Московской Биржи...")
+    
+    try:
+        # Асинхронно скачиваем JSON без блокировки потока
+        df = await fetch_moex_data(ticker)
+        # Обрабатываем данные в памяти
+        result_text = calculate_indicators_and_signal(df, ticker)
+        
+        await status_message.edit_text(result_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка при обработке {ticker}: {e}")
+        await status_message.edit_text("❌ Произошла ошибка при анализе рынка.")
+
+# --- ЖИЗНЕННЫЙ ЦИКЛ БОТА ---
+
+async def main():
+    global http_session
+    # Создаем единую сессию для всех сетевых запросов при старте бота
+    http_session = aiohttp.ClientSession()
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Обязательно закрываем сессию при выключении бота
+        await http_session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
